@@ -32,16 +32,25 @@ from one_memory.secrets import SecretStore, SecretStoreUnavailableError
 
 PRODUCT_AGENT_ID = "all-apps"
 
-#: SDK request ids whose write call is running on a thread right now. A write
+#: SDK request ids with one or more pending or running write calls. A write
 #: the drain gave up on (its work ceiling, a lost lease) keeps running on its
 #: thread; it must not be re-run beside itself (`recover_unknown`).
-_IN_FLIGHT: set[str] = set()
+_IN_FLIGHT: dict[str, int] = {}
 _IN_FLIGHT_LOCK = threading.Lock()
 
 
 def sdk_write_in_flight(request_id: str) -> bool:
     with _IN_FLIGHT_LOCK:
         return request_id in _IN_FLIGHT
+
+
+def _release_tracked(request_id: str) -> None:
+    """Release one registration while holding _IN_FLIGHT_LOCK."""
+    count = _IN_FLIGHT.get(request_id, 0)
+    if count <= 1:
+        _IN_FLIGHT.pop(request_id, None)
+    else:
+        _IN_FLIGHT[request_id] = count - 1
 
 
 class _Tracked:
@@ -57,7 +66,7 @@ class _Tracked:
         self.started = False
         self.abandoned = False
         with _IN_FLIGHT_LOCK:
-            _IN_FLIGHT.add(request_id)
+            _IN_FLIGHT[request_id] = _IN_FLIGHT.get(request_id, 0) + 1
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         with _IN_FLIGHT_LOCK:
@@ -68,20 +77,24 @@ class _Tracked:
             return self.work(*args, **kwargs)
         finally:
             with _IN_FLIGHT_LOCK:
-                _IN_FLIGHT.discard(self.request_id)
+                _release_tracked(self.request_id)
 
     def abandon(self) -> None:
         with _IN_FLIGHT_LOCK:
-            if not self.started:
+            if not self.started and not self.abandoned:
                 self.abandoned = True
-                _IN_FLIGHT.discard(self.request_id)
+                _release_tracked(self.request_id)
 
 
 async def _write(tracked_id: str, work: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     call = _Tracked(tracked_id, work)
     try:
         return await in_sdk_write(call, *args, **kwargs)
-    except asyncio.CancelledError:
+    except (Exception, asyncio.CancelledError):
+        # Submission can fail before the worker starts (for example if the
+        # executor is shutting down). Abandoning is synchronized with worker
+        # start: a queued call cannot later run, and a running call stays
+        # tracked until its own finally block executes.
         call.abandon()
         raise
 

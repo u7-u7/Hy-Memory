@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from one_memory import background_work, sdk_write_processor
 from one_memory.database_access import main_database
 from one_memory.embedding_spaces import EmbeddingIdentity
 from one_memory.memory_server.contracts import BatchIdentity, WriteRequest
@@ -34,6 +36,7 @@ from one_memory.memory_server.durable_queue import (
     evidence_for_request,
     execute_job,
 )
+from one_memory.sdk_write_processor import _write, sdk_write_in_flight
 
 
 def _request(
@@ -5442,3 +5445,266 @@ def test_a_disabled_source_suspends_its_jobs_and_enabling_it_resumes_them(tmp_pa
     assert runtime.status_counts() == {PENDING: 3, COMPLETED: 1}
     assert runtime.queue_depths().fresh == 3
     assert len(drain.claim(limit=10)) == 1
+
+
+# SDK write tracking across executor submission and cancellation.
+
+def test_rejected_submission_does_not_strand_unknown_job(tmp_path, monkeypatch):
+    queue = DurableWriteQueue(tmp_path / "queue.sqlite3")
+    request = WriteRequest(
+        internal_session_id="session",
+        batch_identity=BatchIdentity(internal_session_id="session", first_round=1, last_round=1),
+        evidence_ids=["synthetic"], idempotency_key="rejected-id", source_id="source",
+    )
+    job = queue.submit(request)
+    async def never_execute(_job_id):
+        raise AssertionError("not called")
+    drain = DurableWriteDrain(queue, execute=never_execute, owner="owner")
+    assert drain.claim(limit=1) == (job.job_id,)
+    assert queue.mark_invoked(job.job_id, owner="owner")
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool.shutdown()
+    monkeypatch.setattr(background_work, "sdk_write_pool", lambda: pool)
+    called = threading.Event()
+    with pytest.raises(RuntimeError, match="cannot schedule new futures"):
+        asyncio.run(_write("rejected-id", called.set))
+    assert not called.is_set()
+    assert not sdk_write_in_flight("rejected-id")
+    # Simulate separate interruption before failure settlement, then lease expiry.
+    with sqlite3.connect(queue.database_path) as db:
+        db.execute("UPDATE memory_write_jobs SET lease_expires_at=? WHERE job_id=?",
+                   ("2000-01-01T00:00:00+00:00", job.job_id))
+    assert queue.reclaim_expired() == 1
+    assert queue.get("rejected-id").state == "unknown"
+    assert queue.recover_unknown(in_flight=sdk_write_in_flight) == 1
+    assert queue.get("rejected-id").state == "pending"
+
+
+def test_running_cancel_remains_tracked_until_worker_finishes(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(background_work, "sdk_write_pool", lambda: pool)
+    started, release, ended = threading.Event(), threading.Event(), threading.Event()
+    def work():
+        started.set()
+        try:
+            assert release.wait(5)
+        finally:
+            ended.set()
+    async def scenario():
+        task = asyncio.create_task(_write("running-id", work))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sdk_write_in_flight("running-id")
+        release.set()
+        assert await asyncio.to_thread(ended.wait, 5)
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+    assert not sdk_write_in_flight("running-id")
+
+
+def test_cancelled_queued_call_never_starts(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(background_work, "sdk_write_pool", lambda: pool)
+    occupied, release, called = threading.Event(), threading.Event(), threading.Event()
+    def block():
+        occupied.set()
+        assert release.wait(5)
+    blocker = pool.submit(block)
+    async def scenario():
+        assert await asyncio.to_thread(occupied.wait, 5)
+        task = asyncio.create_task(_write("queued-id", called.set))
+        await asyncio.sleep(0)
+        assert sdk_write_in_flight("queued-id")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not sdk_write_in_flight("queued-id")
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        blocker.result(timeout=5)
+        pool.shutdown(wait=True)
+    assert not called.is_set()
+
+
+def test_worker_failure_and_success_clear_only_their_own_ids(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(background_work, "sdk_write_pool", lambda: pool)
+    started, release = threading.Event(), threading.Event()
+    def slow():
+        started.set()
+        assert release.wait(5)
+        return "done"
+    def fail():
+        raise ValueError("synthetic failure")
+    async def scenario():
+        task = asyncio.create_task(_write("slow-id", slow))
+        assert await asyncio.to_thread(started.wait, 5)
+        with pytest.raises(ValueError, match="synthetic failure"):
+            await _write("failed-id", fail)
+        assert not sdk_write_in_flight("failed-id")
+        assert sdk_write_in_flight("slow-id")
+        release.set()
+        assert await task == "done"
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+    assert not sdk_write_in_flight("slow-id")
+
+
+def test_submission_error_after_enqueue_abandons_queued_work(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    occupied, release, called = threading.Event(), threading.Event(), threading.Event()
+    blocker = pool.submit(lambda: (occupied.set(), release.wait(5)))
+    assert occupied.wait(5)
+    submitted = []
+    async def enqueue_then_raise(call, *args, **kwargs):
+        submitted.append(pool.submit(call, *args, **kwargs))
+        raise RuntimeError("failure after enqueue")
+    monkeypatch.setattr(sdk_write_processor, "in_sdk_write", enqueue_then_raise)
+    try:
+        with pytest.raises(RuntimeError, match="failure after enqueue"):
+            asyncio.run(_write("queued-failure-id", called.set))
+        assert not sdk_write_in_flight("queued-failure-id")
+        release.set()
+        blocker.result(timeout=5)
+        with pytest.raises(RuntimeError, match="hy_memory_write_abandoned"):
+            submitted[0].result(timeout=5)
+        assert not called.is_set()
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+
+def test_error_after_worker_start_keeps_id_until_work_finishes(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    started, release, ended = threading.Event(), threading.Event(), threading.Event()
+    submitted = []
+    def work():
+        started.set()
+        try:
+            assert release.wait(5)
+        finally:
+            ended.set()
+    async def start_then_raise(call, *args, **kwargs):
+        submitted.append(pool.submit(call, *args, **kwargs))
+        assert await asyncio.to_thread(started.wait, 5)
+        raise RuntimeError("error after start")
+    monkeypatch.setattr(sdk_write_processor, "in_sdk_write", start_then_raise)
+    try:
+        with pytest.raises(RuntimeError, match="error after start"):
+            asyncio.run(_write("started-error-id", work))
+        assert sdk_write_in_flight("started-error-id")
+        release.set()
+        submitted[0].result(timeout=5)
+        assert ended.is_set()
+        assert not sdk_write_in_flight("started-error-id")
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+
+def test_rejected_duplicate_id_does_not_untrack_running_call(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    started, release = threading.Event(), threading.Event()
+    def slow():
+        started.set()
+        assert release.wait(5)
+    async def submit_or_reject(call, *args, **kwargs):
+        if call.work is slow:
+            return await asyncio.wrap_future(pool.submit(call, *args, **kwargs))
+        raise RuntimeError("duplicate rejected")
+    monkeypatch.setattr(sdk_write_processor, "in_sdk_write", submit_or_reject)
+    async def scenario():
+        running = asyncio.create_task(_write("same-id", slow))
+        assert await asyncio.to_thread(started.wait, 5)
+        with pytest.raises(RuntimeError, match="duplicate rejected"):
+            await _write("same-id", lambda: None)
+        assert sdk_write_in_flight("same-id")
+        release.set()
+        await running
+        assert not sdk_write_in_flight("same-id")
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+
+def test_abandon_is_idempotent_with_another_same_id_registration():
+    first = sdk_write_processor._Tracked("idempotent-id", lambda: None)
+    second = sdk_write_processor._Tracked("idempotent-id", lambda: None)
+    first.abandon()
+    first.abandon()
+    assert sdk_write_in_flight("idempotent-id")
+    second.abandon()
+    assert not sdk_write_in_flight("idempotent-id")
+    with pytest.raises(RuntimeError, match="hy_memory_write_abandoned"):
+        first()
+    assert not sdk_write_in_flight("idempotent-id")
+
+
+def test_unknown_queue_does_not_recover_while_same_id_is_running(tmp_path, monkeypatch):
+    queue = DurableWriteQueue(tmp_path / "running.sqlite3")
+    request = WriteRequest(
+        internal_session_id="session", batch_identity=BatchIdentity(
+            internal_session_id="session", first_round=1, last_round=1,
+        ), evidence_ids=["synthetic"], idempotency_key="active-id", source_id="source",
+    )
+    job = queue.submit(request)
+    async def never_execute(_job_id):
+        raise AssertionError("not called")
+    drain = DurableWriteDrain(queue, execute=never_execute, owner="owner")
+    assert drain.claim(limit=1) == (job.job_id,)
+    assert queue.mark_invoked(job.job_id, owner="owner")
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(background_work, "sdk_write_pool", lambda: pool)
+    started, release = threading.Event(), threading.Event()
+    def work():
+        started.set()
+        assert release.wait(5)
+    async def scenario():
+        running = asyncio.create_task(_write("active-id", work))
+        assert await asyncio.to_thread(started.wait, 5)
+        # A second registration for the same id is abandoned before it starts.
+        duplicate = sdk_write_processor._Tracked("active-id", lambda: None)
+        duplicate.abandon()
+        with sqlite3.connect(queue.database_path) as db:
+            db.execute("UPDATE memory_write_jobs SET lease_expires_at=? WHERE job_id=?",
+                       ("2000-01-01T00:00:00+00:00", job.job_id))
+        assert queue.reclaim_expired() == 1
+        assert queue.get("active-id").state == "unknown"
+        assert queue.recover_unknown(in_flight=sdk_write_in_flight) == 0
+        release.set()
+        await running
+        assert queue.recover_unknown(in_flight=sdk_write_in_flight) == 1
+        assert queue.get("active-id").state == "pending"
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+
+def test_fast_completion_then_cancel_does_not_leave_registration(monkeypatch):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(background_work, "sdk_write_pool", lambda: pool)
+    async def scenario():
+        for i in range(50):
+            request_id = f"quick-{i}"
+            task = asyncio.create_task(_write(request_id, lambda: "done"))
+            assert await task == "done"
+            assert not task.cancel()
+            assert not sdk_write_in_flight(request_id)
+    try:
+        asyncio.run(scenario())
+    finally:
+        pool.shutdown(wait=True)
